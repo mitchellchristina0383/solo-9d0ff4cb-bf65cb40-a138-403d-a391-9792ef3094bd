@@ -6,6 +6,11 @@ services:
       - "8000:8000"
     environment:
       DATA_DIR: /data
+      # 应用层容量上限（卷内承诺占用不得超过此值）。
+      # 支持纯字节数或带单位后缀（b/k/m/g/t，1k=1024）；
+      # 设为 0 或 unlimited 表示不限制。两个 worker 共享同一账本，
+      # 创建任务时原子校验：预留（2×文件大小，含拼装峰值）超上限即拒绝。
+      STORAGE_LIMIT: ${STORAGE_LIMIT:-512MiB}
     volumes:
       - uploader-data:/data
     restart: unless-stopped

@@ -32,8 +32,9 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-from . import storage as storage_mod
+from . import quota, storage as storage_mod
 from .db import connect, init_db
+from .quota import capacity_snapshot, parse_limit
 from .storage import Storage
 
 CHUNK_SIZE = 1024 * 1024  # 1 MiB
@@ -69,12 +70,20 @@ def _expected_chunk_size(task, index: int) -> int:
     return task["size"] - task["chunk_size"] * (task["total_chunks"] - 1)
 
 
-def create_app(data_dir=None) -> FastAPI:
+def create_app(data_dir=None, storage_limit=None) -> FastAPI:
     data_dir = Path(data_dir or os.environ.get("DATA_DIR", "data")).resolve()
+    if storage_limit is None:
+        storage_limit = parse_limit(os.environ.get("STORAGE_LIMIT"))
+    else:
+        storage_limit = parse_limit(storage_limit)
     storage = Storage(data_dir)
     storage.ensure_dirs()
     init_db(storage.db_path)
     storage.cleanup_stale_tmp()
+    # Rebuild the capacity ledger from the disk before serving traffic:
+    # residual files from crashes keep charging, vanished ones are released,
+    # and pre-upgrade tasks get their peak reservation backfilled.
+    storage.reconcile_report = quota.reconcile(storage.db_path, storage)
 
     app = FastAPI(title="Incident Package Uploader")
 
@@ -106,6 +115,8 @@ def create_app(data_dir=None) -> FastAPI:
             "state": task["state"],
             "created_at": task["created_at"],
             "published_at": task["published_at"],
+            "reserved_bytes": task["reserved_bytes"],
+            "retained_bytes": task["retained_bytes"],
         }
         if task["state"] == "published":
             payload["download_url"] = f"/api/tasks/{task['id']}/download"
@@ -116,6 +127,10 @@ def create_app(data_dir=None) -> FastAPI:
     def health():
         return {"ok": True}
 
+    @app.get("/api/capacity")
+    def get_capacity():
+        return capacity_snapshot(storage.db_path, storage, storage_limit)
+
     @app.post("/api/tasks", status_code=201)
     def create_task(body: CreateTask):
         sha = body.sha256.lower()
@@ -123,23 +138,47 @@ def create_app(data_dir=None) -> FastAPI:
             raise HTTPException(400, "sha256 must be 64 hex characters")
         total_chunks = (body.size + CHUNK_SIZE - 1) // CHUNK_SIZE
         task_id = uuid.uuid4().hex
+        filename = _sanitize_filename(body.filename)
+        created_at = _now_iso()
+
+        # Admission + task row in one serialized transaction: on rejection
+        # nothing is committed, so no task row or file is left behind.
+        try:
+            reserved = quota.insert_admitted_task(
+                storage.db_path,
+                storage_limit,
+                task_id,
+                filename,
+                body.size,
+                sha,
+                CHUNK_SIZE,
+                total_chunks,
+                created_at,
+            )
+        except quota.CapacityExceeded as exc:
+            snap = capacity_snapshot(storage.db_path, storage, storage_limit)
+            return JSONResponse(
+                status_code=507,
+                content={
+                    "detail": str(exc),
+                    "error": "insufficient_storage",
+                    "needed_bytes": exc.needed,
+                    "available_bytes": exc.available,
+                    "limit_bytes": snap["limit_bytes"],
+                    "reserved_bytes": snap["reserved_bytes"],
+                    "capacity": snap,
+                },
+            )
+
         conn = connect(storage.db_path)
         try:
-            conn.execute(
-                "INSERT INTO tasks (id, filename, size, sha256, chunk_size,"
-                " total_chunks, state, created_at) VALUES (?,?,?,?,?,?, 'uploading', ?)",
-                (
-                    task_id,
-                    _sanitize_filename(body.filename),
-                    body.size,
-                    sha,
-                    CHUNK_SIZE,
-                    total_chunks,
-                    _now_iso(),
-                ),
-            )
             task = get_task_or_404(conn, task_id)
-            return JSONResponse(status_code=201, content=status_payload(conn, task))
+            payload = status_payload(conn, task)
+            payload["reserved_bytes"] = reserved
+            payload["capacity"] = capacity_snapshot(
+                storage.db_path, storage, storage_limit
+            )
+            return JSONResponse(status_code=201, content=payload)
         finally:
             conn.close()
 
@@ -163,6 +202,8 @@ def create_app(data_dir=None) -> FastAPI:
                         "state": r["state"],
                         "created_at": r["created_at"],
                         "published_at": r["published_at"],
+                        "reserved_bytes": r["reserved_bytes"],
+                        "retained_bytes": r["retained_bytes"],
                     }
                     for r in rows
                 ]
@@ -345,9 +386,17 @@ def create_app(data_dir=None) -> FastAPI:
                 actual = digest.hexdigest()
                 if total != task["size"] or actual != task["sha256"]:
                     storage_mod.unlink_quiet(tmp)
+                    retained = conn.execute(
+                        "SELECT COALESCE(SUM(size),0) AS kept FROM chunks"
+                        " WHERE task_id = ?",
+                        (task_id,),
+                    ).fetchone()["kept"]
                     conn.execute(
                         "UPDATE tasks SET state = 'failed' WHERE id = ?", (task_id,)
                     )
+                    # Settle to the chunks' real footprint (kept as
+                    # evidence): release the 2*size promise, retain actual.
+                    quota.settle_failed(conn, task_id, retained)
                     return JSONResponse(
                         status_code=409,
                         content={
@@ -376,6 +425,11 @@ def create_app(data_dir=None) -> FastAPI:
                     " WHERE id = ?",
                     (_now_iso(), task_id),
                 )
+                # Settle: delete the chunk files first, then replace the
+                # 2*size peak promise with the product's actual footprint.
+                # If a chunk cannot be removed the promise is kept, so
+                # capacity is never released while files still occupy it.
+                quota.settle_published(conn, storage, task_id, total)
                 return {
                     "state": "published",
                     "download_url": f"/api/tasks/{task_id}/download",

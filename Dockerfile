@@ -9,6 +9,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
 
 ENV DATA_DIR=/data
+# 应用层容量预留上限，可用 STORAGE_LIMIT 在 compose 中覆盖；
+# 0 / unlimited 表示不限制。
+ENV STORAGE_LIMIT=512MiB
 VOLUME /data
 EXPOSE 8000
 

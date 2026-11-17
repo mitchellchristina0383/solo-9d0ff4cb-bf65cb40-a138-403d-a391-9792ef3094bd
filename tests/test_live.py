@@ -32,10 +32,12 @@ def free_port() -> int:
 
 
 class Server:
-    def __init__(self, data_dir: Path, log_dir: Path):
+    def __init__(self, data_dir: Path, log_dir: Path, extra_env: dict | None = None):
         self.port = free_port()
         self.base = f"http://127.0.0.1:{self.port}"
         env = dict(os.environ, DATA_DIR=str(data_dir), PYTHONPATH=str(ROOT))
+        if extra_env:
+            env.update(extra_env)
         self.log = open(log_dir / f"server-{self.port}.log", "wb")
         self.proc = subprocess.Popen(
             [sys.executable, "-m", "uvicorn", "app.main:app",
@@ -200,3 +202,124 @@ def test_concurrent_duplicate_same_chunk_across_processes(tmp_path):
     finally:
         s1.stop()
         s2.stop()
+
+
+def test_capacity_admission_raced_across_processes(tmp_path):
+    """Two processes create tasks concurrently: total promise <= cap."""
+    data_dir = tmp_path / "data"
+    # Each task promises 2 MiB; a 5 MiB cap admits exactly two.
+    s1, s2 = Server(
+        data_dir, tmp_path, extra_env={"STORAGE_LIMIT": str(5 * 1024 ** 2)}
+    ), Server(
+        data_dir, tmp_path, extra_env={"STORAGE_LIMIT": str(5 * 1024 ** 2)}
+    )
+    try:
+        s1.wait_ready()
+        s2.wait_ready()
+        data = b"z" * (1024 * 1024)  # 1 MiB file -> 2 MiB peak promise
+        with httpx.Client(timeout=30) as client:
+            cap = client.get(f"{s1.base}/api/capacity").json()
+            assert cap["limit_bytes"] == 5 * 1024 ** 2
+            assert cap["available_bytes"] == cap["limit_bytes"]
+
+            bases = [s1.base, s2.base] * 3
+            with ThreadPoolExecutor(max_workers=6) as ex:
+                futs = [
+                    ex.submit(
+                        client.post,
+                        f"{bases[i]}/api/tasks",
+                        json={"filename": f"p{i}.bin", "size": len(data),
+                              "sha256": sha256(data)},
+                    )
+                    for i in range(6)
+                ]
+                responses = [f.result() for f in futs]
+
+            codes = sorted(r.status_code for r in responses)
+            assert codes.count(201) == 2 and codes.count(507) == 4
+            for r in responses:
+                if r.status_code == 507:
+                    assert r.json()["error"] == "insufficient_storage"
+
+            snap = client.get(f"{s2.base}/api/capacity").json()
+            assert snap["reserved_bytes"] == 4 * 1024 ** 2
+            assert snap["reserved_bytes"] <= snap["limit_bytes"]
+            assert len(client.get(f"{s1.base}/api/tasks").json()["tasks"]) == 2
+
+            # Admitted tasks still upload and publish on either process;
+            # after one settles to its 1 MiB product, no over-admission.
+            tid = next(
+                r.json()["task_id"] for r in responses if r.status_code == 201
+            )
+            assert put_chunk(client, s2.base, tid, 0, data).status_code == 200
+            fr = client.post(f"{s1.base}/api/tasks/{tid}/finalize")
+            assert fr.status_code == 200 and fr.json()["state"] == "published"
+            assert client.get(
+                f"{s2.base}/api/tasks/{tid}/download").content == data
+    finally:
+        s1.stop()
+        s2.stop()
+
+
+def test_capacity_reconciled_after_kill_and_cap_lowered(tmp_path):
+    """Crash leftovers keep charging after restart; lowered cap blocks new
+    admission while an admitted task still finishes and its package stays
+    downloadable."""
+    data_dir = tmp_path / "data"
+    s1 = Server(data_dir, tmp_path,
+                extra_env={"STORAGE_LIMIT": str(20 * 1024 ** 2)})
+    s1.wait_ready()
+    data = random.Random(5).randbytes(2 * CHUNK + 10)  # 3 chunks, ~2 MiB
+    try:
+        with httpx.Client(timeout=30) as client:
+            tid = create_task(client, s1.base, data)
+            chunks = [data[i:i + CHUNK] for i in range(0, len(data), CHUNK)]
+            assert put_chunk(client, s1.base, tid, 0, chunks[0]).status_code == 200
+            cap_before = client.get(f"{s1.base}/api/capacity").json()
+            assert cap_before["reserved_bytes"] == 2 * len(data)
+    finally:
+        s1.kill()
+
+    # A crash leftover must keep charging capacity after the restart.
+    leftover = data_dir / "tmp" / ".pub-orphan-live"
+    leftover.write_bytes(b"q" * 5000)
+
+    # Restart with a cap lowered below the current 2*size promise.
+    s2 = Server(data_dir, tmp_path,
+                extra_env={"STORAGE_LIMIT": str(1024 ** 2)})
+    try:
+        s2.wait_ready()
+        with httpx.Client(timeout=30) as client:
+            snap = client.get(f"{s2.base}/api/capacity").json()
+            assert snap["over_limit"] is True
+            assert snap["available_bytes"] == 0
+            assert snap["orphan_files"]["count"] == 1
+            assert snap["orphan_files"]["bytes"] == 5000
+            assert snap["reserved_bytes"] == 2 * len(data) + 5000
+
+            # New admission paused; the admitted task still resumes.
+            blocked = client.post(f"{s2.base}/api/tasks", json={
+                "filename": "new.bin", "size": 10, "sha256": sha256(b"x" * 10)})
+            assert blocked.status_code == 507
+
+            assert put_chunk(client, s2.base, tid, 1, chunks[1]).status_code == 200
+            assert put_chunk(client, s2.base, tid, 2, chunks[2]).status_code == 200
+            fr = client.post(f"{s2.base}/api/tasks/{tid}/finalize")
+            assert fr.status_code == 200 and fr.json()["state"] == "published"
+            assert client.get(f"{s2.base}/api/tasks/{tid}/download").content == data
+    finally:
+        s2.kill()
+
+    # Published package survives another restart; orphan still accounted.
+    s3 = Server(data_dir, tmp_path,
+                extra_env={"STORAGE_LIMIT": str(20 * 1024 ** 2)})
+    try:
+        s3.wait_ready()
+        with httpx.Client(timeout=30) as client:
+            assert client.get(
+                f"{s3.base}/api/tasks/{tid}/download").content == data
+            snap = client.get(f"{s3.base}/api/capacity").json()
+            assert snap["orphan_files"]["bytes"] == 5000
+            assert snap["tasks"]["published"]["retained_bytes"] == len(data)
+    finally:
+        s3.stop()
